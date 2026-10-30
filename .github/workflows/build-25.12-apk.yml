@@ -1,0 +1,94 @@
+name: "Build APK with OpenWrt 25.12 SDK"
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-25.12-apk.yml"
+
+env:
+  TZ: Asia/Shanghai
+  OPENWRT_VERSION: 25.12.6
+
+jobs:
+  build:
+    name: Build ${{ matrix.sdk_arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86/64, sdk_arch: x86_64 }
+          - { target: mvebu/cortexa53, sdk_arch: aarch64_cortex-a53 }
+          - { target: ramips/mt7621, sdk_arch: mipsel_24kc }
+    steps:
+      - name: Install packages
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install zstd build-essential clang flex bison g++ gawk gcc-multilib g++-multilib gettext git libncurses5-dev libssl-dev python3-venv rsync unzip zlib1g-dev file wget
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: qmodem
+
+      - name: Download SDK
+        run: |
+          sdk_url="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}/targets/${{ matrix.target }}/"
+          wget -q "${sdk_url}sha256sums"
+          grep '\*openwrt-sdk-.*\.tar\.zst$' sha256sums | sed 's/ \*/  /' > sdk.sha256
+          [ "$(wc -l < sdk.sha256)" = 1 ] || { echo "expected one SDK in sha256sums" >&2; exit 1; }
+          sdk_file=$(awk '{print $2}' sdk.sha256)
+          wget -q "${sdk_url}${sdk_file}"
+          sha256sum -c sdk.sha256
+          mkdir sdk
+          tar --zstd -xf "$sdk_file" -C sdk --strip-components=1
+
+      - name: Prepare feeds and config
+        working-directory: sdk
+        run: |
+          feed_ref="openwrt-${OPENWRT_VERSION%.*}"
+          echo "src-git base https://github.com/openwrt/openwrt.git;$feed_ref" > feeds.conf
+          echo "src-git packages https://github.com/openwrt/packages.git;$feed_ref" >> feeds.conf
+          echo "src-git luci https://github.com/openwrt/luci.git;$feed_ref" >> feeds.conf
+          echo "src-git routing https://git.openwrt.org/feed/routing.git;$feed_ref" >> feeds.conf
+          echo "src-link qmodem $GITHUB_WORKSPACE/qmodem" >> feeds.conf
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          rm -rf feeds/base/package/kernel/gpio-button-hotplug
+          echo "CONFIG_ALL_NONSHARED=n" > .config
+          echo "CONFIG_ALL_KMODS=n" >> .config
+          echo "CONFIG_ALL=n" >> .config
+          echo "CONFIG_AUTOREMOVE=n" >> .config
+          echo "CONFIG_LUCI_LANG_zh_Hans=y" >> .config
+          cat ../qmodem/.github/workflows/openwrt_package.config >> .config
+          make defconfig
+          make clean
+          # make clean may regenerate package selections, same as main.yml.
+          sed -i '/^CONFIG_PACKAGE_gpio-button-hotplug=/d;/^CONFIG_PACKAGE_libopenssl=/d;/^CONFIG_PACKAGE_openssl-util=/d' .config
+          echo 'CONFIG_PACKAGE_gpio-button-hotplug=n' >> .config
+          echo 'CONFIG_PACKAGE_libopenssl=n' >> .config
+          echo 'CONFIG_PACKAGE_openssl-util=n' >> .config
+
+      - name: Compile QModem
+        working-directory: sdk
+        run: |
+          set -euo pipefail
+          for package in $(cat ../qmodem/.github/workflows/qmodem_package_generic ../qmodem/.github/workflows/qmodem_package_arch); do
+            make package/$package/compile -j$(nproc)
+          done
+          package_dir="bin/packages/${{ matrix.sdk_arch }}/qmodem"
+          for package in qmodem qmodem-smsd sms-forwarder-next qmodem-uplink-manager luci-app-qmodem-uplink luci-app-qmodem-next luci-i18n-qmodem-next-zh-cn; do
+            compgen -G "$package_dir/${package}-*.apk" >/dev/null || {
+              echo "missing required package: $package" >&2
+              exit 1
+            }
+          done
+          ls "$package_dir"
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: QModem-${{ env.OPENWRT_VERSION }}-${{ matrix.sdk_arch }}
+          path: sdk/bin/packages/${{ matrix.sdk_arch }}/qmodem/*
+          retention-days: 7

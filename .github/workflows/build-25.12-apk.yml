@@ -92,3 +92,24 @@ jobs:
           name: QModem-${{ env.OPENWRT_VERSION }}-${{ matrix.sdk_arch }}
           path: sdk/bin/packages/${{ matrix.sdk_arch }}/qmodem/*
           retention-days: 7
+
+      - name: Install the packages from the official repositories
+        working-directory: sdk
+        run: |
+          base="https://downloads.openwrt.org/releases/${OPENWRT_VERSION}"
+          target="$base/targets/${{ matrix.target }}"
+          kmods=$(wget -qO- "$target/kmods/" | grep -oE 'href="[0-9][^"/]*/"' | head -1 | cut -d'"' -f2)
+          {
+            echo "$target/packages/packages.adb"
+            echo "$target/kmods/${kmods}packages.adb"
+            for feed in base packages luci routing; do
+              echo "$base/packages/${{ matrix.sdk_arch }}/$feed/packages.adb"
+            done
+          } > official-repos
+          cat official-repos
+          # ponytail: unpacks into an empty root without scripts, so it proves
+          # dependency resolution and file conflicts, not runtime behaviour.
+          sudo staging_dir/host/bin/apk --root "$(mktemp -d)" --arch "${{ matrix.sdk_arch }}" \
+            --allow-untrusted --no-scripts --no-cache --no-logfile \
+            --repositories-file official-repos \
+            add --initdb bin/packages/${{ matrix.sdk_arch }}/qmodem/*.apk

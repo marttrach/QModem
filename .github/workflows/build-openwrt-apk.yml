@@ -1,19 +1,47 @@
-name: "Build APK with OpenWrt 25.12 SDK"
+name: "Build APK with the latest OpenWrt stable SDK"
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
   push:
     paths:
-      - ".github/workflows/build-25.12-apk.yml"
+      - ".github/workflows/build-openwrt-apk.yml"
 
 env:
   TZ: Asia/Shanghai
-  OPENWRT_VERSION: 25.12.6
 
 jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.detect.outputs.version }}
+      build: ${{ steps.detect.outputs.build }}
+    steps:
+      - name: Find the latest OpenWrt stable version
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(curl -fsSL https://downloads.openwrt.org/.versions.json | jq -r .stable_version)
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "unexpected stable version: $version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # Only the daily check skips a version; a manual run rebuilds it from the current commit.
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && gh release view "openwrt-$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "openwrt-$version is already released"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "building for OpenWrt $version"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: Build ${{ matrix.sdk_arch }}
+    needs: detect
+    if: needs.detect.outputs.build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      OPENWRT_VERSION: ${{ needs.detect.outputs.version }}
     strategy:
       fail-fast: false
       matrix:
@@ -113,3 +141,33 @@ jobs:
             --allow-untrusted --no-scripts --no-cache --no-logfile \
             --repositories-file official-repos \
             add --initdb bin/packages/${{ matrix.sdk_arch }}/qmodem/*.apk
+
+  release:
+    needs: [detect, build]
+    # Any failed architecture fails build, so a release always has all of them.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: QModem-*
+          path: artifacts
+
+      - name: Package artifacts into tar.gz
+        run: |
+          mkdir releases
+          for dir in artifacts/*; do
+            tar -czf "releases/$(basename "$dir").tar.gz" -C "$dir" .
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2.2.2
+        with:
+          tag_name: openwrt-${{ needs.detect.outputs.version }}
+          name: QModem for OpenWrt ${{ needs.detect.outputs.version }}
+          body: "APK packages for OpenWrt ${{ needs.detect.outputs.version }}, built from ${{ github.sha }}."
+          make_latest: false
+          files: releases/*

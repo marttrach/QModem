@@ -1,7 +1,7 @@
 name: "Build APK with the latest OpenWrt stable SDK"
 on:
   workflow_dispatch:
-  # Schedules only run from the default branch.
+  # GitHub only runs schedules from the default branch.
   schedule:
     - cron: "0 2 * * *"
   push:
